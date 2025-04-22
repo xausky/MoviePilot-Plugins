@@ -4,6 +4,8 @@ import re
 import time
 import base64
 import json
+import sqlite3
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event
@@ -118,7 +120,6 @@ class TorInfo:
             else:
                 # 单文件种子
                 size = info["length"]
-                
             local_tor = TorInfo(info_hash=info_hash, pieces_hash=pieces_hash, size=size)
             # 从种子中获取 announce, qb可能存在获取不到的情况，会存在于fastresume文件中
             if "announce" in torrent:
@@ -161,6 +162,7 @@ class UniSeed(_PluginBase):
     sites = None
     siteoper = None
     torrent = None
+    _thread_local = threading.local()
     # 开关
     _enabled = False
     _cron = None
@@ -202,6 +204,10 @@ class UniSeed(_PluginBase):
         self.siteoper = SiteOper()
         self.torrent = TorrentHelper()
         self.torrents = TorrentsChain()
+        
+        # 初始化数据库
+        self._init_db()
+        
         # 读取配置
         if config:
             self._enabled = config.get("enabled")
@@ -1035,7 +1041,7 @@ class UniSeed(_PluginBase):
         return None
 
     @staticmethod
-    def __get_redict_url(url: str, proxies: str = None, ua: str = None, cookie: str = None) -> Optional[str]:
+    def get_redict_url(url: str, proxies: str = None, ua: str = None, cookie: str = None) -> Optional[str]:
         """
         获取下载链接， url格式：[base64]url
         """
@@ -1266,18 +1272,20 @@ class UniSeed(_PluginBase):
                 # 保存配置
                 self.__update_config()
 
-    def browse_torrents_cached(self, site: CSSiteConfig):
+    def refresh_torrents_cached(self, site: CSSiteConfig) -> tuple[str, str]:
         """
-        浏览种子并且缓存
+        浏览种子并且存储到数据库
         """
         domain = self.siteoper.get(site.id).domain
         torrents = self.torrents.browse(domain=domain)
-        # torrent 数据：TorrentInfo(site=1, site_name='馒头', site_cookie='', site_ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0', site_proxy=0, site_order=3, title='The Glory S01E24 1080p NF WEB-DL DDP5.1 H.264-MWeb ', description='雁回时 | 2025 | 中国大陆 | 爱情 悬疑 古装 | 杨龙 | 陈都灵 辛云来 | 第1季第24集', imdbid='tt31869080', enclosure='[eyJtZXRob2QiOiAicG9zdCIsICJjb29raWUiOiBmYWxzZSwgInBhcmFtcyI6IHsiaWQiOiAiOTM0MzA3In0sICJoZWFkZXIiOiB7IkNvbnRlbnQtVHlwZSI6ICJhcHBsaWNhdGlvbi9qc29uIiwgIlVzZXItQWdlbnQiOiAiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEyOC4wLjAuMCBTYWZhcmkvNTM3LjM2IEVkZy8xMjguMC4wLjAiLCAiQWNjZXB0IjogImFwcGxpY2F0aW9uL2pzb24sIHRleHQvcGxhaW4sICovKiIsICJ4LWFwaS1rZXkiOiAiMjAwZjgyZWMtYjEwMC00MTRjLWI4YTMtYTQxMDZmZGM1YTZkIn0sICJyZXN1bHQiOiAiZGF0YSJ9]https://api.m-team.cc/api/torrent/genDlToken', page_url='https://kp.m-team.cc/detail/934307', size=2139478491, seeders=1, peers=607, grabs=0, pubdate='2025-03-31 21:04:57', date_elapsed=None, freedate=None, uploadvolumefactor=1, downloadvolumefactor=0, hit_and_run=False, labels=['国配', '中字'], pri_order=0, category='电视剧')
-        # 从 page_url 中提取种子 ID
-        if not self._torrent_browse_cache.get(domain):
-            self._torrent_browse_cache[domain] = {}
         
-        logger.info(f"缓存种子数量: { domain }: { len(self._torrent_browse_cache[domain]) }")
+        # 从数据库获取已缓存种子的 IDs
+        cached_torrent_ids = self._get_cached_torrent_ids(site.name)
+        
+        # 更新数据库中的种子信息
+        save_count = 0
+        first_enclosure = None
+        first_torrent_id = None
         for torrent in torrents:
             # 提取种子 ID
             torrent_id = None
@@ -1286,13 +1294,135 @@ class UniSeed(_PluginBase):
                 match = re.search(r'/(\d+)$', torrent.page_url)
                 if match:
                     torrent_id = match.group(1)
+                    if not first_enclosure:
+                        first_enclosure = torrent.enclosure
+                        first_torrent_id = torrent_id
+                    
+            # 如果成功提取到 ID 且不在缓存中，则添加到数据库
+            if torrent_id and torrent_id not in cached_torrent_ids:
+                self._save_torrent(site.name, torrent, torrent_id)
+                save_count = save_count + 1
+        logger.info(f"数据库中缓存的站点 {site.name} 的种子数量 {len(cached_torrent_ids)} 本次新增 {save_count}")
+        return first_enclosure, first_torrent_id
+
+
+    def _get_cached_torrent_ids(self, site_name: str) -> set:
+        """
+        获取已缓存种子的 IDs
+        """
+        connect = self._get_connect()
+        if not connect:
+            return set()
+        
+        try:
+            cursor = connect.cursor()
+            cursor.execute('SELECT torrent_id FROM torrents WHERE site_name = ?', (site_name,))
+            rows = cursor.fetchall()
+            return {row[0] for row in rows}
+        except Exception as e:
+            logger.error(f"获取已缓存种子ID失败: {str(e)}")
+        return set()
+    
+    def _get_connect(self):
+        """
+        获取数据库连接，确保每个线程有自己的连接
+        """
+        if not hasattr(self._thread_local, 'db'):
+            path = os.path.join(settings.CONFIG_PATH, "uniseed.db");
+            self._thread_local.db = sqlite3.connect(path)
+            logger.info(f"创建 SQLite 数据库连接 {path} 在线程 {threading.current_thread().name}")
+        return self._thread_local.db
+
+    def _init_db(self):
+        """
+        初始化数据库
+        """
+        try:
+            db = self._get_connect()
+            cursor = db.cursor()
             
-            # 如果成功提取到 ID 且不在缓存中，则添加到新种子列表
-            if torrent_id and torrent_id not in self._torrent_browse_cache[domain]:
-                self._torrent_browse_cache[domain][torrent_id] = torrent
-        logger.info(f"返回种子数量: { domain }: { len(self._torrent_browse_cache[domain]) }")
-        # 返回历史缓存加本次新增的全量数据
-        return list(self._torrent_browse_cache[domain].values())
+            # 创建种子表
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS torrents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    site_name TEXT NOT NULL,
+                    torrent_id TEXT NOT NULL,
+                    title TEXT,
+                    size INTEGER,
+                    pieces_hash TEXT,
+                    content BLOB,
+                    page_url TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(site_name, torrent_id)
+                )
+            ''')
+            
+            # 创建索引
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_domain_torrent_id ON torrents(site_name, torrent_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_pieces_hash ON torrents(site_name, pieces_hash)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_size ON torrents(site_name, size)')
+
+            db.commit()
+        except Exception as e:
+            logger.error(f"初始化数据库失败: {str(e)}")
+            if hasattr(self._thread_local, 'db'):
+                self._thread_local.db.close()
+                del self._thread_local.db
+
+    def _save_torrent(self, site_name: str, torrent: Any, torrent_id: int):
+        """
+        保存种子信息到数据库
+        """
+        connect = self._get_connect()
+        if not connect:
+            return
+            
+        try:
+            cursor = connect.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO torrents 
+                (site_name, torrent_id, title, size, pieces_hash, content, page_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                site_name,
+                torrent_id,
+                torrent.title,
+                torrent.size,
+                getattr(torrent, 'hash', None),
+                getattr(torrent, 'content', None),
+                torrent.page_url
+            ))
+            connect.commit()
+        except Exception as e:
+            logger.error(f"保存种子信息失败: {str(e)}")
+
+    def _get_torrents_by_size(self, site: CSSiteConfig, size: int) -> List[Any]:
+        """
+        根据种子大小从数据库获取种子信息
+        """
+        connect = self._get_connect()
+        if not connect:
+            return []
+            
+        try:
+            cursor = connect.cursor()
+            cursor.execute('SELECT torrent_id, title, size, pieces_hash, content, page_url FROM torrents WHERE site_name = ? AND size = ?', (site.name, size))
+            rows = cursor.fetchall()
+            torrents = []
+            for row in rows:
+                torrent = type('TorrentInfo', (), {
+                    'torrent_id': row[0],
+                    'title': row[1],
+                    'size': row[2],
+                    'hash': row[3],
+                    'content': row[4],
+                    'page_url': row[5]
+                })
+                torrents.append(torrent)
+            return torrents
+        except Exception as e:
+            logger.error(f"获取种子信息失败: {str(e)}")
+        return []
 
 class CrossSeedHelper(object):
     _version = "0.2.0"
@@ -1349,6 +1479,40 @@ class CrossSeedHelper(object):
         return remote_torrent_infos, None
     
     @staticmethod
+    def make_enclosure_template(
+        enclosure_template: str,
+        old_torrent_id: str,
+        new_torrent_id: str,
+    ) -> str:
+        """
+        根据旧种子ID和新的种子ID生成新的种子下载链接
+        如果是包括 [xxx] 则，xxx 部分需要先 base64 解码再替换，其他部分直接替换
+        """
+        # 检查是否包含 [xxx] 格式
+        if "[" in enclosure_template and "]" in enclosure_template:
+            # 使用 [ 和 ] 拆分字符串
+            parts = enclosure_template.split("[")
+            if len(parts) > 1:
+                # 获取 [ 后面的部分
+                after_bracket = parts[1]
+                # 使用 ] 再次拆分
+                bracket_content = after_bracket.split("]")[0]
+                # 对 [xxx] 中的内容进行 base64 解码
+                try:
+                    decoded = base64.b64decode(bracket_content).decode('utf-8')
+                    # 替换解码后的内容
+                    decoded = decoded.replace(old_torrent_id, new_torrent_id)
+                    # 重新编码
+                    encoded = base64.b64encode(decoded.encode('utf-8')).decode('utf-8')
+                    # 重新组合字符串
+                    enclosure_template = parts[0] + "[" + encoded + "]" + "]".join(after_bracket.split("]")[1:])
+                except Exception as e:
+                    logger.error(f"Base64 解码/编码失败: {str(e)}")
+        
+        # 替换其他部分
+        return enclosure_template.replace(old_torrent_id, new_torrent_id)
+    
+    @staticmethod
     def get_target_torrent_by_uni(
             site: CSSiteConfig,
             hash_strs: list,
@@ -1358,23 +1522,23 @@ class CrossSeedHelper(object):
         通过uni获取目标种子信息
         """
         remote_torrent_infos = []
-        torrents = seed.browse_torrents_cached(site)
+        enclosure_template, template_torrent_id = seed.refresh_torrents_cached(site)
         for item in hash_strs:
             tor_info: TorInfo = item.get("torrent_info")
-            for torrent in torrents:
-                if tor_info.size != torrent.size:
-                    continue
+            # 在数据库中查找匹配的种子大小
+            matching_torrents = seed._get_torrents_by_size(site, tor_info.size)
+            for torrent in matching_torrents:
                 if torrent.hash is None:
                     # 获取下载链接
-                    torrent_content = torrent.enclosure
+                    torrent_content = CrossSeedHelper.make_enclosure_template(enclosure_template, template_torrent_id, torrent.torrent_id)
                     # proxies
-                    proxies = settings.PROXY if torrent.site_proxy else None
+                    proxies = settings.PROXY if site.proxy else None
                     # cookie
-                    cookies = torrent.site_cookie
+                    cookies = site.cookie
                     if torrent_content.startswith("["):
-                        torrent_content = seed.__get_redict_url(url=torrent_content,
+                        torrent_content = UniSeed.get_redict_url(url=torrent_content,
                                                                 proxies=proxies,
-                                                                ua=torrent.site_ua,
+                                                                ua=site.ua,
                                                                 cookie=cookies)
                         # 目前馒头请求实际种子时，不能传入Cookie
                         cookies = None
@@ -1398,8 +1562,7 @@ class CrossSeedHelper(object):
                 if tor_info.pieces_hash != torrent.hash:
                     logger.info(f"种子 {torrent.title} Hash 不一致: {tor_info.pieces_hash} != {torrent.hash}")
                     continue
-                torrent_id = torrent.page_url.split("/")[-1]
-                remote_torrent = TorInfo.remote(site.name, tor_info.pieces_hash, torrent_id, torrent.size)
+                remote_torrent = TorInfo.remote(site.name, tor_info.pieces_hash, torrent.torrent_id, torrent.size)
                 remote_torrent.content = torrent.content
                 remote_torrent_infos.append(remote_torrent)
 
