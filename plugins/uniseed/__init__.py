@@ -1536,7 +1536,7 @@ class CrossSeedHelper(object):
                     # cookie
                     cookies = site.cookie
                     if torrent_content.startswith("["):
-                        torrent_content = UniSeed.__get_redict_url(url=torrent_content,
+                        torrent_content = UniSeed.get_redict_url(url=torrent_content,
                                                                 proxies=proxies,
                                                                 ua=site.ua,
                                                                 cookie=cookies)
