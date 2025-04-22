@@ -1527,6 +1527,8 @@ class CrossSeedHelper(object):
             tor_info: TorInfo = item.get("torrent_info")
             # 在数据库中查找匹配的种子大小
             matching_torrents = seed._get_torrents_by_size(site, tor_info.size)
+            if len(matching_torrents) > 0:
+                logger.info(f"size matched torrents {len(matching_torrents)}")
             for torrent in matching_torrents:
                 if torrent.hash is None:
                     # 获取下载链接
@@ -1536,7 +1538,7 @@ class CrossSeedHelper(object):
                     # cookie
                     cookies = site.cookie
                     if torrent_content.startswith("["):
-                        torrent_content = UniSeed.get_redict_url(url=torrent_content,
+                        torrent_content = UniSeed.__get_redict_url(url=torrent_content,
                                                                 proxies=proxies,
                                                                 ua=site.ua,
                                                                 cookie=cookies)
